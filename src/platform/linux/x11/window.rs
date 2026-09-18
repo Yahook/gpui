@@ -264,6 +264,12 @@ pub struct X11WindowState {
     background_appearance: WindowBackgroundAppearance,
     maximized_vertical: bool,
     maximized_horizontal: bool,
+    /// `_NET_WM_STATE_HIDDEN`: the window manager is not showing the window,
+    /// which on X11 is what being minimized looks like. Tracked but not read:
+    /// it used to veto `is_maximized`, which is wrong, and the one thing it
+    /// would be right for - telling `visibility()` that an iconified window is
+    /// not visible - is a separate bug, filed upstream as zed#64388.
+    #[allow(dead_code)]
     hidden: bool,
     active: bool,
     hovered: bool,
@@ -1230,8 +1236,13 @@ impl PlatformWindow for X11Window {
     fn is_maximized(&self) -> bool {
         let state = self.0.state.borrow();
 
-        // A maximized window that gets minimized will still retain its maximized state.
-        !state.hidden && state.maximized_vertical && state.maximized_horizontal
+        // A maximized window that gets minimized will still retain its
+        // maximized state - so `hidden` has no say here. `_NET_WM_STATE` keeps
+        // `_MAXIMIZED_VERT` and `_MAXIMIZED_HORZ` next to `_HIDDEN` while the
+        // window is iconified (EWMH 1.5, _NET_WM_STATE), and answering `false`
+        // made minimizing a maximized window indistinguishable from
+        // unmaximizing it.
+        state.maximized_vertical && state.maximized_horizontal
     }
 
     fn window_bounds(&self) -> WindowBounds {
