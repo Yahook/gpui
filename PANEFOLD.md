@@ -81,10 +81,29 @@ so a new base only needs the four files re-patched.
 
 ## Testing a change
 
-panefold points at this fork through `[patch.crates-io]`. It carries a switch,
-`PANEFOLD_NO_WORKAROUND=1`, that turns off its own X11 workarounds so that what
-the window does is this fork's doing and nothing else. Check a saved position
-survives three restarts unchanged, that `state.toml` agrees with `xwininfo` on
-the client window, and that a window saved maximized at a size **unlike** the
-work area comes back with `_NET_WM_STATE_MAXIMIZED_HORZ` and `_VERT` — the last
-one only proves anything at a size mutter could not have maximized by itself.
+panefold points at this fork through `[patch.crates-io]` and carries no window
+placement workarounds of its own any more - what the window does is this
+fork's doing and nothing else. Four things to check, measured on mutter /
+GNOME, X11:
+
+- A saved position opens where it was saved, and survives a restart. Read the
+  CLIENT window, not the frame: `xwininfo -name 'panefold (dev)'` answers with
+  mutter's frame, which sits 14 px left and 49 px above the window and is
+  wider and taller by the decorations. `xwininfo -root -tree | grep
+  panefold-dev` is the line that means the window.
+- Dragging the window updates the saved position. panefold records it from
+  gpui's `moved` callback while rendering, so a move that is not also a resize
+  has to arrive.
+- A window saved maximized comes back with `_NET_WM_STATE_MAXIMIZED_HORZ` and
+  `_VERT` in `xprop`. Save it at a size **unlike** the work area, or the test
+  proves nothing: mutter maximizes a window of its own accord when the size
+  asked for matches, and that is how bug 3 hid for a while.
+- Nothing jumps at startup. Sample the position every few milliseconds for the
+  first seconds of a run: there should be exactly one placement, the right
+  one. Before this fork there were two - mutter's own spot first, panefold's
+  move about 230 ms later.
+
+Measured this way on 2026-09-18, against panefold with its workarounds
+deleted: one placement at +129 ms, a drag reaching `state.toml` unchanged, and
+a window saved `900x600 maximized` coming back maximized and unmaximizing to
+`900x600` where it was left.
