@@ -1000,7 +1000,7 @@ impl Window {
         if let Some(ref window_open_state) = window_bounds {
             match window_open_state {
                 WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
-                WindowBounds::Maximized(_) => platform_window.zoom(),
+                WindowBounds::Maximized(_) => platform_window.set_maximized(true),
                 WindowBounds::Windowed(_) => {}
             }
         }

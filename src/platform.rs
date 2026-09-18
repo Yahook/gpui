@@ -485,6 +485,15 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);
     fn zoom(&self);
+    /// Maximizes or unmaximizes the window, as against [`zoom`], which
+    /// toggles. Platforms that have no way to say which are left toggling.
+    ///
+    /// [`zoom`]: PlatformWindow::zoom
+    fn set_maximized(&self, maximized: bool) {
+        if maximized {
+            self.zoom();
+        }
+    }
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);

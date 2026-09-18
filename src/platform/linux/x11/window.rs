@@ -17,7 +17,7 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::WmSizeHints,
+    properties::{WmSizeHints, WmSizeHintsSpecification},
     protocol::{
         sync,
         xinput::{self, ConnectionExt as _},
@@ -268,6 +268,17 @@ pub struct X11WindowState {
     active: bool,
     hovered: bool,
     fullscreen: bool,
+    /// Whether `map_window` has been called. Before it has, EWMH says the
+    /// window's state is set as a PROPERTY; a `_NET_WM_STATE` message about a
+    /// window the window manager has never seen is dropped.
+    mapped: bool,
+    /// A maximize asked for before the window was mapped, to ask for again
+    /// once the window manager has the window. Measured against mutter: the
+    /// property EWMH says to set on an unmapped window is written and
+    /// ignored, and so is a message sent immediately after `MapWindow` - the
+    /// window manager has not taken the window yet. Only a message sent once
+    /// `MapNotify` has arrived is acted on.
+    maximize_when_mapped: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
@@ -455,7 +466,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -465,7 +476,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -490,34 +501,49 @@ impl X11WindowState {
                 ),
             )?;
 
-            if let Some(size) = params.window_min_size {
-                let mut size_hints = WmSizeHints::new();
-                let min_size = (size.width.0 as i32, size.height.0 as i32);
-                size_hints.min_size = Some(min_size);
-                check_reply(
-                    || {
-                        format!(
-                            "X11 change of WM_SIZE_HINTS failed. min_size: {:?}",
-                            min_size
-                        )
-                    },
-                    size_hints.set_normal_hints(xcb, x_window),
-                )?;
-            }
+            // ICCCM 4.1.2.3: a window manager is free to place a window
+            // wherever it likes unless the client says the position is meant,
+            // and a position flag in `WM_NORMAL_HINTS` is the only way to say
+            // so. Without one the position handed to `CreateWindow` is a
+            // suggestion - mutter ignores it and drops the window at a spot of
+            // its own - so a `WindowBounds` carrying a remembered position had
+            // no effect at all.
+            //
+            // `StaticGravity` goes with it: it makes the position the place of
+            // the WINDOW rather than of the frame the window manager wraps it
+            // in, so a window comes back where it was left instead of a title
+            // bar lower each time.
+            let mut size_hints = WmSizeHints::new();
+            size_hints.position = Some((
+                WmSizeHintsSpecification::UserSpecified,
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+            ));
+            size_hints.win_gravity = Some(xproto::Gravity::STATIC);
+            let min_size = params
+                .window_min_size
+                .map(|size| (size.width.0 as i32, size.height.0 as i32));
+            size_hints.min_size = min_size;
+            check_reply(
+                || {
+                    format!(
+                        "X11 change of WM_SIZE_HINTS failed. min_size: {:?}",
+                        min_size
+                    )
+                },
+                size_hints.set_normal_hints(xcb, x_window),
+            )?;
 
-            let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
-            if reply.x == 0 && reply.y == 0 {
-                bounds.origin.x.0 += 2;
-                // Work around a bug where our rendered content appears
-                // outside the window bounds when opened at the default position
-                // (14px, 49px on X + Gnome + Ubuntu 22).
-                let x = bounds.origin.x.0;
-                let y = bounds.origin.y.0;
-                check_reply(
-                    || format!("X11 ConfigureWindow failed. x: {}, y: {}", x, y),
-                    xcb.configure_window(x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
-                )?;
-            }
+            // What used to be here: two pixels added to the requested x, and
+            // a nudge of the window by two more whenever it had been placed at
+            // the origin, "to work around a bug where our rendered content
+            // appears outside the window bounds when opened at the default
+            // position (14px, 49px on X + Gnome + Ubuntu 22)". That default
+            // position was the bug above - the frame inset read back as the
+            // window's place on the screen - and with the position asked for
+            // honoured there is nothing left to work around. Keeping the two
+            // pixels now walks the window right across the screen, two at a
+            // time, once a saved position is restored into a fresh window.
             if let Some(titlebar) = params.titlebar
                 && let Some(title) = titlebar.title
             {
@@ -681,6 +707,8 @@ impl X11WindowState {
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
+                mapped: false,
+                maximize_when_mapped: false,
                 hidden: false,
                 appearance,
                 handle,
@@ -754,8 +782,8 @@ impl Drop for X11Window {
 }
 
 enum WmHintPropertyState {
-    // Remove = 0,
-    // Add = 1,
+    Remove = 0,
+    Add = 1,
     Toggle = 2,
 }
 
@@ -1082,13 +1110,14 @@ impl X11WindowStatePtr {
             is_resize = bounds.size.width != state.bounds.size.width
                 || bounds.size.height != state.bounds.size.height;
 
-            // If it's a resize event (only width/height changed), we ignore `bounds.origin`
-            // because it contains wrong values.
-            if is_resize {
-                state.bounds.size = bounds.size;
-            } else {
-                state.bounds = bounds;
-            }
+            // The origin used to be thrown away on a resize "because it
+            // contains wrong values" - it was the window's inset into the
+            // window manager's frame rather than its place on the screen.
+            // The `ConfigureNotify` handler now translates it to root
+            // coordinates, so it is worth keeping: dropping it left a window
+            // that was dragged and resized in one gesture reporting the
+            // position it had before.
+            state.bounds = bounds;
 
             let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
             if true {
@@ -1143,6 +1172,53 @@ impl X11WindowStatePtr {
         if let Some(ref mut fun) = callbacks.appearance_changed {
             (fun)()
         }
+    }
+}
+
+impl X11WindowStatePtr {
+    /// Sends the maximize this window was asked for before it was mapped, if
+    /// it was. Called from the `MapNotify` handler, which is the first moment
+    /// the window manager is known to have the window: EWMH says an unmapped
+    /// window's state is set as a property, but mutter reads neither that nor
+    /// a message sent alongside the map.
+    pub fn maximize_if_asked(&self) {
+        let (asked, net_wm_state, horizontal, vertical, root) = {
+            let mut state = self.state.borrow_mut();
+            (
+                std::mem::take(&mut state.maximize_when_mapped),
+                state.atoms._NET_WM_STATE,
+                state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+                state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+                state.x_root_window,
+            )
+        };
+        if !asked {
+            return;
+        }
+        const FROM_AN_APPLICATION: u32 = 1;
+        let message = ClientMessageEvent::new(
+            32,
+            self.x_window,
+            net_wm_state,
+            [
+                WmHintPropertyState::Add as u32,
+                horizontal,
+                vertical,
+                FROM_AN_APPLICATION,
+                0,
+            ],
+        );
+        check_reply(
+            || "X11 SendEvent to maximize a newly mapped window failed.",
+            self.xcb.send_event(
+                false,
+                root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                message,
+            ),
+        )
+        .log_err();
+        self.xcb.flush().log_err();
     }
 }
 
@@ -1374,7 +1450,66 @@ impl PlatformWindow for X11Window {
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
         )?;
+        self.0.state.borrow_mut().mapped = true;
+        // The maximize this may owe the window is sent from the `MapNotify`
+        // handler: see `X11WindowStatePtr::maximize_if_asked`.
         Ok(())
+    }
+
+    /// Maximizes or unmaximizes the window, as against [`zoom`], which
+    /// toggles whichever way it is now.
+    ///
+    /// A window that is about to be opened maximized has not been mapped yet,
+    /// and EWMH is explicit that the state of an unmapped window is set as a
+    /// property rather than asked for by message - a `_NET_WM_STATE` message
+    /// about a window the window manager has never seen is dropped, which is
+    /// why asking to open maximized used to open the right size and plain. It
+    /// also has to be an add rather than a toggle: a window manager may have
+    /// maximized the window itself (mutter does when the size asked for
+    /// matches the work area), and a toggle would then undo it.
+    ///
+    /// [`zoom`]: PlatformWindow::zoom
+    fn set_maximized(&self, maximized: bool) {
+        let state = self.0.state.borrow();
+        let (horizontal, vertical) = (
+            state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+            state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+        );
+        if !state.mapped {
+            let property = if maximized {
+                vec![horizontal, vertical]
+            } else {
+                Vec::new()
+            };
+            let (net_wm_state, x_window) = (state.atoms._NET_WM_STATE, self.0.x_window);
+            drop(state);
+            self.0.state.borrow_mut().maximize_when_mapped = maximized;
+            check_reply(
+                || "X11 ChangeProperty for _NET_WM_STATE failed.",
+                self.0.xcb.change_property32(
+                    xproto::PropMode::REPLACE,
+                    x_window,
+                    net_wm_state,
+                    xproto::AtomEnum::ATOM,
+                    &property,
+                ),
+            )
+            .log_err();
+            return;
+        }
+        let wanted = if maximized {
+            WmHintPropertyState::Add
+        } else {
+            WmHintPropertyState::Remove
+        };
+        drop(state);
+        self.set_wm_hints(
+            || "X11 SendEvent to maximize a window failed.",
+            wanted,
+            vertical,
+            horizontal,
+        )
+        .log_err();
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {

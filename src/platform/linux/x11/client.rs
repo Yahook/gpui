@@ -745,11 +745,19 @@ impl X11Client {
                 state.update_refresh_loop(event.window);
             }
             Event::MapNotify(event) => {
-                let mut state = self.0.borrow_mut();
-                if let Some(window_ref) = state.windows.get_mut(&event.window) {
-                    window_ref.is_mapped = true;
+                {
+                    let mut state = self.0.borrow_mut();
+                    if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                        window_ref.is_mapped = true;
+                    }
+                    state.update_refresh_loop(event.window);
                 }
-                state.update_refresh_loop(event.window);
+                // The window manager has the window now: a `WindowBounds`
+                // that asked for it maximized can finally say so. The borrow
+                // above is released first - this talks to the server.
+                if let Some(window) = self.get_window(event.window) {
+                    window.maximize_if_asked();
+                }
             }
             Event::VisibilityNotify(event) => {
                 let mut state = self.0.borrow_mut();
@@ -880,11 +888,48 @@ impl X11Client {
                 }
             }
             Event::ConfigureNotify(event) => {
-                let bounds = Bounds {
-                    origin: Point {
+                // A `ConfigureNotify` the server generated carries the
+                // window's position inside its PARENT. Under a reparenting
+                // window manager that parent is the window manager's frame,
+                // so the position is the inset into the frame - a number that
+                // does not change when the window is dragged across the
+                // screen, because the window does not move inside its frame.
+                // Only the synthetic `ConfigureNotify` the window manager
+                // sends alongside is in root coordinates (ICCCM 4.2.3), so
+                // for the server-generated one the server is asked to
+                // translate. Taking `event.x`/`event.y` from both is why
+                // `set_bounds` below has to call the origin wrong.
+                const SENT_BY_A_CLIENT: u8 = 0x80;
+                let origin = if event.response_type & SENT_BY_A_CLIENT != 0 {
+                    Point {
                         x: event.x.into(),
                         y: event.y.into(),
-                    },
+                    }
+                } else {
+                    // The borrow is released before the round trip: holding
+                    // it across one is how the client state ends up borrowed
+                    // twice.
+                    let (xcb, root) = {
+                        let state = self.0.borrow();
+                        let root = state.xcb_connection.setup().roots[state.x_root_index].root;
+                        (state.xcb_connection.clone(), root)
+                    };
+                    xcb.translate_coordinates(event.window, root, 0, 0)
+                        .ok()
+                        .and_then(|cookie| cookie.reply().ok())
+                        .map_or(
+                            Point {
+                                x: event.x.into(),
+                                y: event.y.into(),
+                            },
+                            |reply| Point {
+                                x: reply.dst_x.into(),
+                                y: reply.dst_y.into(),
+                            },
+                        )
+                };
+                let bounds = Bounds {
+                    origin,
                     size: Size {
                         width: event.width.into(),
                         height: event.height.into(),
