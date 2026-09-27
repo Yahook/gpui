@@ -1,7 +1,8 @@
 # What this fork changes, and why it exists
 
 This is [gpui](https://crates.io/crates/gpui) 0.2.2 — the last published
-release — with four X11 window bugs fixed. The base commit is the crates.io
+release — with four X11 window bugs fixed, and a lost Vulkan surface (section
+5) made again instead of taking the application down. The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -102,11 +103,66 @@ different bug, filed as zed#64388.
 A real unmaximize is still told apart, because it hands back the smaller
 rectangle: measured, `+300+650 1050x720` with an empty `_NET_WM_STATE`.
 
+## 5. A lost Vulkan surface killed the application
+
+blade-graphics 0.7.1, the version gpui 0.2.2 renders with on Linux, answered
+`VK_ERROR_SURFACE_LOST_KHR` with a panic in three places: `acquire_frame`
+(`panic!("Aquire image error ...")`), a present (`check_gpu_crash`:
+`panic!("GPU error ...")`) and `reconfigure_surface` (`unwrap` on every
+surface query and on `create_swapchain`). A surface is lost when the window
+system takes it away - a driver reset, a display going away, and on lavapipe
+under Xvfb now and then on a fresh server: panefold's headless stand died with
+`Aquire image error ERROR_SURFACE_LOST_KHR` on 2026-09-22 and 2026-09-26, and
+twelve stop/start/run cycles on 2026-09-27 did not bring it back.
+
+blade `main` (checked 2026-09-27) logs the acquire error instead of
+panicking, but still panics on the present, and a logged error alone would
+leave the window frozen: a lost surface stays lost, every later acquire fails
+the same way, and gpui never makes a new one.
+
+So `vendor/blade-graphics` is 0.7.1 (the commit before this one is the
+crates.io tarball, unmodified) with:
+
+- `Surface::is_lost()`; `acquire_frame`, a present and `reconfigure_surface`
+  mark the surface lost and carry on instead of panicking. Other acquire
+  errors are logged, as on blade `main`.
+- `Context::recreate_surface(&mut surface, &window, config)`: a new
+  `VkSurfaceKHR` for the same window, the old swapchain destroyed first (a
+  window has one swapchain at a time), then configured. On failure the old
+  surface stays, lost, and the call can be repeated.
+- `create_surface` no longer leaks the `VkSurfaceKHR` it rejects - once per
+  retry of a lost surface otherwise.
+- `BLADE_FAKE_SURFACE_LOST=N` makes every Nth acquire report a lost surface
+  and says so on stderr, which is how the recovery below was measured.
+
+gpui's `BladeRenderer` keeps the window's raw handles and, in `draw`, acquires
+the frame *before* the command encoder starts: on a lost surface it makes the
+surface again and acquires once more; if that fails too the frame is skipped
+without a half-recorded command buffer, and the next draw tries again.
+Pipelines are rebuilt when the new surface's format or alpha differ.
+
+Measured on 2026-09-27, panefold on lavapipe under Xvfb with
+`BLADE_FAKE_SURFACE_LOST=5`: 1823 lost surfaces in about two minutes of
+pointer motion, each one made again, the window still redrawing (its CPU
+temperature footer changing between shots), resident memory flat at
+153-156 MB and 43 open files throughout.
+
+Cargo ignores `[patch]` in a dependency, so a crate using this fork patches
+crates.io's `blade-graphics` to this repository itself, at the same rev:
+
+    gpui = { git = "https://github.com/Yahook/gpui.git", rev = "..." }
+    blade-graphics = { git = "https://github.com/Yahook/gpui.git", rev = "..." }
+
+Built on its own, the fork's `Cargo.toml` does the same with a path.
+
 ## Rebasing onto a newer gpui
 
-`git diff 0aaf41f..HEAD -- src/` is the whole patch. Nothing touches a public
-API except the added `PlatformWindow::set_maximized`, which has a default body,
-so a new base only needs the four files re-patched.
+`git diff 0aaf41f..HEAD -- src/` is the whole patch to gpui. Nothing touches a
+public API except the added `PlatformWindow::set_maximized`, which has a
+default body, so a new base only needs those files re-patched.
+`git diff 3e65e9a..HEAD -- vendor/` is the patch to blade-graphics; a gpui
+that has moved to another blade needs it carried there, or dropped once blade
+recovers a lost surface on its own.
 
 ## Testing a change
 

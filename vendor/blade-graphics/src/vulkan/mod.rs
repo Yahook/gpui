@@ -103,6 +103,9 @@ pub struct Surface {
     next_semaphore: vk::Semaphore,
     swapchain: Swapchain,
     full_screen_exclusive: bool,
+    // The window system took the surface away (`VK_ERROR_SURFACE_LOST_KHR`).
+    // Nothing brings it back but `Context::recreate_surface`.
+    lost: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

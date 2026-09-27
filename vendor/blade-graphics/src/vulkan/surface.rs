@@ -20,7 +20,33 @@ impl super::Surface {
         }
     }
 
+    /// Whether the window system took this surface away. A lost surface
+    /// hands out frames without an image until `Context::recreate_surface`
+    /// replaces it.
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    // A frame that is not presented, for when no image can be acquired.
+    fn frame_without_image(&self) -> super::Frame {
+        super::Frame {
+            internal: self.frames.first().copied().unwrap_or_default(),
+            swapchain: self.swapchain,
+            image_index: None,
+        }
+    }
+
     pub fn acquire_frame(&mut self) -> super::Frame {
+        if self.lost || self.swapchain.raw == vk::SwapchainKHR::null() {
+            return self.frame_without_image();
+        }
+        if fake_surface_lost() {
+            // stderr, not `log`: a check has to see it whether or not the
+            // application installed a logger.
+            eprintln!("blade: faking a lost surface ({FAKE_SURFACE_LOST})");
+            self.lost = true;
+            return self.frame_without_image();
+        }
         let acquire_semaphore = self.next_semaphore;
         match unsafe {
             self.device.acquire_next_image(
@@ -43,14 +69,45 @@ impl super::Surface {
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 log::warn!("Acquire failed because the surface is out of date");
-                super::Frame {
-                    internal: self.frames[0],
-                    swapchain: self.swapchain,
-                    image_index: None,
-                }
+                self.frame_without_image()
             }
-            Err(other) => panic!("Aquire image error {}", other),
+            // 0.7.1 panicked here, and took the whole application down with a
+            // window that a driver reset or a display change had merely
+            // invalidated.
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                log::warn!("Acquire failed because the surface is lost");
+                self.lost = true;
+                self.frame_without_image()
+            }
+            Err(other) => {
+                log::error!("Acquire image error: {}", other);
+                self.frame_without_image()
+            }
         }
+    }
+}
+
+/// Makes every Nth acquire report a lost surface, N from this variable - the
+/// only way to see a recovery on demand: a real `VK_ERROR_SURFACE_LOST_KHR`
+/// comes from a driver reset or a display going away.
+const FAKE_SURFACE_LOST: &str = "BLADE_FAKE_SURFACE_LOST";
+
+fn fake_surface_lost() -> bool {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    };
+    static EVERY: OnceLock<Option<u64>> = OnceLock::new();
+    static ACQUIRES: AtomicU64 = AtomicU64::new(0);
+    let every = *EVERY.get_or_init(|| {
+        std::env::var(FAKE_SURFACE_LOST)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    });
+    match every {
+        Some(n) => (ACQUIRES.fetch_add(1, Ordering::Relaxed) + 1) % n == 0,
+        None => false,
     }
 }
 
@@ -91,6 +148,8 @@ impl super::Context {
             ) != Ok(true)
         } {
             log::warn!("Rejected for not presenting to the window surface");
+            // 0.7.1 leaked the surface here, once per retry of a lost one.
+            unsafe { khr_surface.destroy_surface(raw, None) };
             return Err(crate::NotSupportedError::PlatformNotSupported);
         }
 
@@ -136,7 +195,31 @@ impl super::Context {
                 target_size: [0; 2],
             },
             full_screen_exclusive: fullscreen_exclusive_ext.full_screen_exclusive_supported != 0,
+            lost: false,
         })
+    }
+
+    /// Gives a lost surface a new `VkSurfaceKHR` for the same window and
+    /// configures it. On failure the surface stays as it was, lost, and the
+    /// call can be repeated.
+    pub fn recreate_surface<
+        I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+    >(
+        &self,
+        surface: &mut super::Surface,
+        window: &I,
+        config: crate::SurfaceConfig,
+    ) -> Result<(), crate::NotSupportedError> {
+        let fresh = self.create_surface(window)?;
+        // The old swapchain goes before the new one is made: a window has
+        // one swapchain at a time (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`).
+        let mut old = mem::replace(surface, fresh);
+        self.destroy_surface(&mut old);
+        self.reconfigure_surface(surface, config);
+        if surface.lost {
+            return Err(super::PlatformError::Init(vk::Result::ERROR_SURFACE_LOST_KHR).into());
+        }
+        Ok(())
     }
 
     pub fn destroy_surface(&self, surface: &mut super::Surface) {
@@ -151,13 +234,19 @@ impl super::Context {
         }
     }
 
+    /// Leaves a lost surface as it is: see `Surface::is_lost`.
     pub fn reconfigure_surface(&self, surface: &mut super::Surface, config: crate::SurfaceConfig) {
+        if surface.lost {
+            log::warn!("Not reconfiguring a lost surface");
+            return;
+        }
         let khr_surface = self.instance.surface.as_ref().unwrap();
 
-        let capabilities = unsafe {
-            khr_surface
-                .get_physical_device_surface_capabilities(self.physical_device, surface.raw)
-                .unwrap()
+        let result = unsafe {
+            khr_surface.get_physical_device_surface_capabilities(self.physical_device, surface.raw)
+        };
+        let Some(capabilities) = unless_lost(surface, "Surface capabilities", result) else {
+            return;
         };
         if config.size.width < capabilities.min_image_extent.width
             || config.size.width > capabilities.max_image_extent.width
@@ -220,10 +309,11 @@ impl super::Context {
         };
         let effective_frame_count = requested_frame_count.max(capabilities.min_image_count);
 
-        let present_modes = unsafe {
-            khr_surface
-                .get_physical_device_surface_present_modes(self.physical_device, surface.raw)
-                .unwrap()
+        let result = unsafe {
+            khr_surface.get_physical_device_surface_present_modes(self.physical_device, surface.raw)
+        };
+        let Some(present_modes) = unless_lost(surface, "Surface present modes", result) else {
+            return;
         };
         let present_mode = *mode_preferences
             .iter()
@@ -260,11 +350,13 @@ impl super::Context {
                 },
             )
         } else {
-            supported_formats = unsafe {
-                khr_surface
-                    .get_physical_device_surface_formats(self.physical_device, surface.raw)
-                    .unwrap()
+            let result = unsafe {
+                khr_surface.get_physical_device_surface_formats(self.physical_device, surface.raw)
             };
+            let Some(formats) = unless_lost(surface, "Surface formats", result) else {
+                return;
+            };
+            supported_formats = formats;
             match config.color_space {
                 crate::ColorSpace::Linear => {
                     let surface_format = vk::SurfaceFormatKHR {
@@ -341,7 +433,10 @@ impl super::Context {
                 config.allow_exclusive_full_screen
             );
         }
-        let raw_swapchain = unsafe { surface.device.create_swapchain(&create_info, None).unwrap() };
+        let result = unsafe { surface.device.create_swapchain(&create_info, None) };
+        let Some(raw_swapchain) = unless_lost(surface, "Swapchain creation", result) else {
+            return;
+        };
 
         unsafe {
             surface.deinit_swapchain(&self.device.core);
@@ -396,5 +491,23 @@ impl super::Context {
             alpha,
             target_size,
         };
+    }
+}
+
+// A surface call's value, or `None` once the call finds the surface lost and
+// marks it so. Any other error panics, as the `unwrap` it replaces did.
+fn unless_lost<T>(
+    surface: &mut super::Surface,
+    what: &str,
+    result: Result<T, vk::Result>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+            log::warn!("{what} failed because the surface is lost");
+            surface.lost = true;
+            None
+        }
+        Err(other) => panic!("{what} failed: {other}"),
     }
 }

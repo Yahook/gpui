@@ -445,6 +445,12 @@ impl super::CommandEncoder {
                 log::warn!("GPU frame is out of date");
                 None
             }
+            // A present to a surface the window system took away. The next
+            // acquire finds it lost and says so through `Surface::is_lost`.
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                log::warn!("GPU frame is lost with its surface");
+                None
+            }
             Err(other) => panic!("GPU error {}", other),
         }
     }

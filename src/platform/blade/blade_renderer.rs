@@ -341,6 +341,38 @@ pub struct BladeRenderer {
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
     rendering_parameters: RenderingParameters,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    window: SurfaceWindow,
+}
+
+/// The window a renderer draws into, kept so that a surface the window system
+/// takes away (`VK_ERROR_SURFACE_LOST_KHR`: a driver reset, a display going
+/// away) can be made again instead of freezing or killing the window.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+struct SurfaceWindow {
+    window: raw_window_handle::RawWindowHandle,
+    display: raw_window_handle::RawDisplayHandle,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl raw_window_handle::HasWindowHandle for SurfaceWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: the platform window owns the renderer, so the window the
+        // handle names outlives it.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl raw_window_handle::HasDisplayHandle for SurfaceWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: the display connection outlives every window on it.
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.display) })
+    }
 }
 
 impl BladeRenderer {
@@ -361,6 +393,17 @@ impl BladeRenderer {
             .gpu
             .create_surface_configured(window, surface_config)
             .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?;
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let window = SurfaceWindow {
+            window: window
+                .window_handle()
+                .map_err(|err| anyhow::anyhow!("No window handle: {err:?}"))?
+                .as_raw(),
+            display: window
+                .display_handle()
+                .map_err(|err| anyhow::anyhow!("No display handle: {err:?}"))?
+                .as_raw(),
+        };
 
         let command_encoder = context.gpu.create_command_encoder(gpu::CommandEncoderDesc {
             name: "main",
@@ -427,6 +470,8 @@ impl BladeRenderer {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
             rendering_parameters,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            window,
         })
     }
 
@@ -640,14 +685,70 @@ impl BladeRenderer {
         }
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    fn acquire_frame(&mut self) -> Option<gpu::Frame> {
+        Some(self.surface.acquire_frame())
+    }
+
+    /// The frame to draw into, or `None` while the surface is lost and cannot
+    /// be made again yet; the next draw tries again.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn acquire_frame(&mut self) -> Option<gpu::Frame> {
+        if !self.surface.is_lost() {
+            let frame = self.surface.acquire_frame();
+            if !self.surface.is_lost() {
+                return Some(frame);
+            }
+        }
+        self.recreate_surface()?;
+        let frame = self.surface.acquire_frame();
+        (!self.surface.is_lost()).then_some(frame)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn recreate_surface(&mut self) -> Option<()> {
+        self.wait_for_gpu();
+        let info = self.surface.info();
+        if let Err(err) =
+            self.gpu
+                .recreate_surface(&mut self.surface, &self.window, self.surface_config)
+        {
+            log::error!("Failed to recreate the lost surface: {err:?}");
+            return None;
+        }
+        log::info!("Recreated the lost surface");
+        let new_info = self.surface.info();
+        if new_info.format != info.format {
+            // The path textures are made in the surface's format.
+            let size = self.surface_config.size;
+            self.update_drawable_size_even_if_unchanged(Size {
+                width: DevicePixels(size.width as i32),
+                height: DevicePixels(size.height as i32),
+            });
+        }
+        if new_info != info {
+            self.pipelines.destroy(&self.gpu);
+            self.pipelines = BladePipelines::new(
+                &self.gpu,
+                new_info,
+                self.rendering_parameters.path_sample_count,
+            );
+        }
+        Some(())
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
+        // Before the encoder starts: a frame skipped for a lost surface must
+        // leave no command buffer half recorded.
+        let Some(frame) = ({
+            profiling::scope!("acquire frame");
+            self.acquire_frame()
+        }) else {
+            return;
+        };
         self.command_encoder.start();
         self.atlas.before_frame(&mut self.command_encoder);
 
-        let frame = {
-            profiling::scope!("acquire frame");
-            self.surface.acquire_frame()
-        };
         self.command_encoder.init_texture(frame.texture());
 
         let globals = GlobalParams {
