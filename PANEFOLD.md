@@ -155,6 +155,41 @@ crates.io's `blade-graphics` to this repository itself, at the same rev:
 
 Built on its own, the fork's `Cargo.toml` does the same with a path.
 
+## 6. A stale swapchain froze the window until it was resized
+
+`VK_ERROR_OUT_OF_DATE_KHR` means the swapchain no longer matches the surface,
+and the specification wants a new one: asking the old one again fails again.
+blade-graphics 0.7.1 answered it with a frame that has no image, gpui drew
+into `frames[0]` without having acquired it, and the present silently did
+nothing. gpui only reconfigures the swapchain from `update_drawable_size*` (a
+resize) and `update_transparency`, so a swapchain that went stale without a
+change of size - a suspend and resume, a monitor change, a restore from
+minimized, which on Linux never calls `update_drawable_size_even_if_unchanged`
+- left the window standing still until it was dragged by an edge.
+
+`vendor/blade-graphics` now keeps the fact:
+
+- `Surface::is_out_of_date()`, set by an out-of-date acquire and cleared only
+  by `reconfigure_surface`; until then `acquire_frame` hands out frames without
+  an image without asking the swapchain again.
+- `Frame::is_presentable()`: whether the frame holds an acquired image.
+- `BLADE_FAKE_OUT_OF_DATE=N` makes every Nth acquire find the swapchain out of
+  date, which then stays so - as a real one does - and says so on stderr.
+
+`BladeRenderer::acquire_frame` reconfigures an out-of-date surface at its
+current size and acquires once more, and skips a draw that still has no image
+instead of drawing into one it does not own.
+
+Measured on 2026-09-28, panefold on lavapipe under Xvfb. Without the renderer
+half, `BLADE_FAKE_OUT_OF_DATE=40` froze the window at the first stale
+swapchain: seven shots over 40 seconds with the pointer on different rows,
+all byte for byte the same, no hover, the temperature footer standing still.
+With it, `BLADE_FAKE_OUT_OF_DATE=5`: 1105 stale swapchains in about two
+minutes of pointer motion, each one reconfigured, hover and footer drawn,
+resident memory 157-168 MB without a trend and 53-55 open files; together
+with `BLADE_FAKE_SURFACE_LOST=7`, 443 stale and 253 lost surfaces, the window
+still drawing.
+
 ## Rebasing onto a newer gpui
 
 `git diff 0aaf41f..HEAD -- src/` is the whole patch to gpui. Nothing touches a
@@ -162,7 +197,7 @@ public API except the added `PlatformWindow::set_maximized`, which has a
 default body, so a new base only needs those files re-patched.
 `git diff 3e65e9a..HEAD -- vendor/` is the patch to blade-graphics; a gpui
 that has moved to another blade needs it carried there, or dropped once blade
-recovers a lost surface on its own.
+recovers a lost surface and reconfigures an out-of-date one on its own.
 
 ## Testing a change
 

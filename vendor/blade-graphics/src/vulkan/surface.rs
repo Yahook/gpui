@@ -1,5 +1,9 @@
 use ash::vk;
 use std::mem;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 impl super::Surface {
     pub fn info(&self) -> crate::SurfaceInfo {
@@ -27,6 +31,14 @@ impl super::Surface {
         self.lost
     }
 
+    /// Whether the swapchain no longer matches the surface. An out-of-date
+    /// surface hands out frames without an image until
+    /// `Context::reconfigure_surface` gives it a new swapchain; a window that
+    /// does not change size would otherwise never get one.
+    pub fn is_out_of_date(&self) -> bool {
+        self.out_of_date
+    }
+
     // A frame that is not presented, for when no image can be acquired.
     fn frame_without_image(&self) -> super::Frame {
         super::Frame {
@@ -37,12 +49,27 @@ impl super::Surface {
     }
 
     pub fn acquire_frame(&mut self) -> super::Frame {
-        if self.lost || self.swapchain.raw == vk::SwapchainKHR::null() {
+        // Out of date stays out of date: the specification wants a new
+        // swapchain, and asking the old one again only fails again.
+        if self.lost || self.out_of_date || self.swapchain.raw == vk::SwapchainKHR::null() {
             return self.frame_without_image();
         }
-        if fake_surface_lost() {
-            // stderr, not `log`: a check has to see it whether or not the
-            // application installed a logger.
+        // The fakes say so on stderr, not through `log`: a check has to see
+        // them whether or not the application installed a logger.
+        if fake_every_nth(
+            FAKE_OUT_OF_DATE,
+            &FAKE_OUT_OF_DATE_EVERY,
+            &FAKE_OUT_OF_DATE_COUNT,
+        ) {
+            eprintln!("blade: faking an out-of-date surface ({FAKE_OUT_OF_DATE})");
+            self.out_of_date = true;
+            return self.frame_without_image();
+        }
+        if fake_every_nth(
+            FAKE_SURFACE_LOST,
+            &FAKE_SURFACE_LOST_EVERY,
+            &FAKE_SURFACE_LOST_COUNT,
+        ) {
             eprintln!("blade: faking a lost surface ({FAKE_SURFACE_LOST})");
             self.lost = true;
             return self.frame_without_image();
@@ -69,6 +96,7 @@ impl super::Surface {
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 log::warn!("Acquire failed because the surface is out of date");
+                self.out_of_date = true;
                 self.frame_without_image()
             }
             // 0.7.1 panicked here, and took the whole application down with a
@@ -91,22 +119,27 @@ impl super::Surface {
 /// only way to see a recovery on demand: a real `VK_ERROR_SURFACE_LOST_KHR`
 /// comes from a driver reset or a display going away.
 const FAKE_SURFACE_LOST: &str = "BLADE_FAKE_SURFACE_LOST";
+/// Makes every Nth acquire report an out-of-date swapchain, which stays out
+/// of date until it is reconfigured - as a real `VK_ERROR_OUT_OF_DATE_KHR`
+/// does after a suspend or a monitor change that leaves the window's size.
+const FAKE_OUT_OF_DATE: &str = "BLADE_FAKE_OUT_OF_DATE";
 
-fn fake_surface_lost() -> bool {
-    use std::sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    };
-    static EVERY: OnceLock<Option<u64>> = OnceLock::new();
-    static ACQUIRES: AtomicU64 = AtomicU64::new(0);
-    let every = *EVERY.get_or_init(|| {
-        std::env::var(FAKE_SURFACE_LOST)
+static FAKE_SURFACE_LOST_EVERY: OnceLock<Option<u64>> = OnceLock::new();
+static FAKE_SURFACE_LOST_COUNT: AtomicU64 = AtomicU64::new(0);
+static FAKE_OUT_OF_DATE_EVERY: OnceLock<Option<u64>> = OnceLock::new();
+static FAKE_OUT_OF_DATE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Whether this acquire is the Nth since the last faked one, N read once from
+// `variable`; never when it is unset, zero or not a number.
+fn fake_every_nth(variable: &str, every: &OnceLock<Option<u64>>, count: &AtomicU64) -> bool {
+    let every = *every.get_or_init(|| {
+        std::env::var(variable)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
     });
     match every {
-        Some(n) => (ACQUIRES.fetch_add(1, Ordering::Relaxed) + 1) % n == 0,
+        Some(n) => (count.fetch_add(1, Ordering::Relaxed) + 1) % n == 0,
         None => false,
     }
 }
@@ -196,6 +229,7 @@ impl super::Context {
             },
             full_screen_exclusive: fullscreen_exclusive_ext.full_screen_exclusive_supported != 0,
             lost: false,
+            out_of_date: false,
         })
     }
 
@@ -234,7 +268,8 @@ impl super::Context {
         }
     }
 
-    /// Leaves a lost surface as it is: see `Surface::is_lost`.
+    /// Leaves a lost surface as it is: see `Surface::is_lost`. A new
+    /// swapchain is no longer out of date: see `Surface::is_out_of_date`.
     pub fn reconfigure_surface(&self, surface: &mut super::Surface, config: crate::SurfaceConfig) {
         if surface.lost {
             log::warn!("Not reconfiguring a lost surface");
@@ -491,6 +526,7 @@ impl super::Context {
             alpha,
             target_size,
         };
+        surface.out_of_date = false;
     }
 }
 

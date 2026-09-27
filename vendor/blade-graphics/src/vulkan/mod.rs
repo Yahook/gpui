@@ -106,6 +106,9 @@ pub struct Surface {
     // The window system took the surface away (`VK_ERROR_SURFACE_LOST_KHR`).
     // Nothing brings it back but `Context::recreate_surface`.
     lost: bool,
+    // The swapchain no longer matches the surface (`VK_ERROR_OUT_OF_DATE_KHR`).
+    // It stays so until `Context::reconfigure_surface` makes a new one.
+    out_of_date: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,6 +127,12 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Whether this frame holds an image acquired from the swapchain. One
+    /// that does not can be neither drawn into nor presented.
+    pub fn is_presentable(&self) -> bool {
+        self.image_index.is_some()
+    }
+
     pub fn texture(&self) -> Texture {
         Texture {
             raw: self.internal.image,

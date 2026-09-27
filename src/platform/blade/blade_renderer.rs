@@ -690,19 +690,49 @@ impl BladeRenderer {
         Some(self.surface.acquire_frame())
     }
 
-    /// The frame to draw into, or `None` while the surface is lost and cannot
-    /// be made again yet; the next draw tries again.
+    /// The frame to draw into, or `None` while no image can be had: the
+    /// surface is lost and cannot be made again yet, or the swapchain would
+    /// not hand one out. The next draw tries again.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn acquire_frame(&mut self) -> Option<gpu::Frame> {
         if !self.surface.is_lost() {
             let frame = self.surface.acquire_frame();
-            if !self.surface.is_lost() {
+            if frame.is_presentable() {
                 return Some(frame);
+            }
+            if self.surface.is_out_of_date() {
+                // gpui makes a new swapchain on a resize, and a swapchain can
+                // go stale without one (a suspend, a monitor change): the
+                // window would stay frozen until it was dragged by an edge.
+                self.reconfigure_out_of_date_surface()?;
+                let frame = self.surface.acquire_frame();
+                return frame.is_presentable().then_some(frame);
+            }
+            if !self.surface.is_lost() {
+                // Drawing into an image the swapchain did not hand out is
+                // undefined, and it would not be presented anyway.
+                return None;
             }
         }
         self.recreate_surface()?;
         let frame = self.surface.acquire_frame();
-        (!self.surface.is_lost()).then_some(frame)
+        frame.is_presentable().then_some(frame)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn reconfigure_out_of_date_surface(&mut self) -> Option<()> {
+        self.wait_for_gpu();
+        let info = self.surface.info();
+        self.gpu
+            .reconfigure_surface(&mut self.surface, self.surface_config);
+        if self.surface.is_out_of_date() {
+            // Found lost on the way: the next draw makes it again.
+            log::warn!("Could not reconfigure the out-of-date surface");
+            return None;
+        }
+        log::info!("Reconfigured the out-of-date surface");
+        self.swapchain_replaced(info);
+        Some(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -717,6 +747,14 @@ impl BladeRenderer {
             return None;
         }
         log::info!("Recreated the lost surface");
+        self.swapchain_replaced(info);
+        Some(())
+    }
+
+    /// Follows a new swapchain whose format or alpha may differ from the
+    /// `info` of the one it replaced.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn swapchain_replaced(&mut self, info: gpu::SurfaceInfo) {
         let new_info = self.surface.info();
         if new_info.format != info.format {
             // The path textures are made in the surface's format.
@@ -734,12 +772,11 @@ impl BladeRenderer {
                 self.rendering_parameters.path_sample_count,
             );
         }
-        Some(())
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        // Before the encoder starts: a frame skipped for a lost surface must
-        // leave no command buffer half recorded.
+        // Before the encoder starts: a frame skipped for want of an image
+        // must leave no command buffer half recorded.
         let Some(frame) = ({
             profiling::scope!("acquire frame");
             self.acquire_frame()

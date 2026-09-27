@@ -749,7 +749,8 @@ level = "allow"
 priority = 0
 
 # blade-graphics 0.7.1 with a lost Vulkan surface made again instead of a
-# panic; see `PANEFOLD.md`. This section only applies when the fork is built
+# panic, and an out-of-date swapchain remembered until it is reconfigured;
+# see `PANEFOLD.md`. This section only applies when the fork is built
 # on its own: a crate that depends on the fork patches crates.io to this same
 # copy itself (`blade-graphics = { git = <this repo>, rev = <this rev> }`),
 # because Cargo ignores `[patch]` in a dependency.
