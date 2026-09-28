@@ -1,8 +1,9 @@
 # What this fork changes, and why it exists
 
 This is [gpui](https://crates.io/crates/gpui) 0.2.2 — the last published
-release — with four X11 window bugs fixed, and a lost Vulkan surface (section
-5) made again instead of taking the application down. The base commit is the crates.io
+release — with four X11 window bugs fixed, a lost Vulkan surface (section 5) made
+again instead of taking the application down, and a lost GPU device (section
+7) handed to the application instead of a panic. The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -190,6 +191,40 @@ resident memory 157-168 MB without a trend and 53-55 open files; together
 with `BLADE_FAKE_SURFACE_LOST=7`, 443 stale and 253 lost surfaces, the window
 still drawing.
 
+## 7. A lost GPU device panicked, or hung the renderer
+
+`VK_ERROR_DEVICE_LOST` - a driver reset, a driver updated underneath, a resume
+the driver did not survive - leaves nothing made from the device usable: the
+context gpui shares between windows, the atlas, the pipelines. blade-graphics
+0.7.1 met it in three places:
+
+- a submit or a present (`check_gpu_crash`): `panic!("GPU has crashed ...")`;
+- an acquire, after section 5: logged as any other error, a frame without an
+  image, and the same failure on every frame after it - a window frozen for
+  good;
+- `wait_for`: `false`, as for "not done yet", and gpui's `wait_for_gpu` waits
+  for a lost device in `while !wait_for(..) {}` - a hang at 100% CPU.
+
+Recovering in place would mean rebuilding everything above; an application
+can start itself again instead. `vendor/blade-graphics` now sends all three to
+one place:
+
+- `blade_graphics::set_device_lost_hook(fn(&str))`: what runs on a lost device,
+  told where it was seen. A hook that returns is followed by the panic 0.7.1
+  had, so an application that sets none behaves as before, less the freeze and
+  the hang.
+- `BLADE_FAKE_DEVICE_LOST=N` makes every Nth submit report a lost device, and
+  says so on stderr.
+
+gpui itself is unchanged; panefold sets the hook and `exec`s itself, as its
+Restart does (`src/gpu_lost.rs`).
+
+Measured on 2026-09-28, panefold on lavapipe under Xvfb with
+`BLADE_FAKE_DEVICE_LOST=40`: three lost devices, three restarts under the same
+pid, each window drawing again 73-89 ms after its image started (plus a one
+second pause panefold leaves the driver); the fourth within five minutes made
+panefold give up with exit code 75 and a line saying why. No panic in the log.
+
 ## Rebasing onto a newer gpui
 
 `git diff 0aaf41f..HEAD -- src/` is the whole patch to gpui. Nothing touches a
@@ -197,7 +232,8 @@ public API except the added `PlatformWindow::set_maximized`, which has a
 default body, so a new base only needs those files re-patched.
 `git diff 3e65e9a..HEAD -- vendor/` is the patch to blade-graphics; a gpui
 that has moved to another blade needs it carried there, or dropped once blade
-recovers a lost surface and reconfigures an out-of-date one on its own.
+recovers a lost surface and reconfigures an out-of-date one on its own, and
+lets an application answer a lost device.
 
 ## Testing a change
 

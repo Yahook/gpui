@@ -424,7 +424,10 @@ impl super::CommandEncoder {
         }
     }
 
-    pub(super) fn check_gpu_crash<T>(&self, ret: Result<T, vk::Result>) -> Option<T> {
+    // `place` names the call for a lost device: 0.7.1 panicked there, which
+    // took the whole application down; now the hook
+    // (`crate::set_device_lost_hook`) has its say first.
+    pub(super) fn check_gpu_crash<T>(&self, ret: Result<T, vk::Result>, place: &str) -> Option<T> {
         match ret {
             Ok(value) => Some(value),
             Err(vk::Result::ERROR_DEVICE_LOST) => match self.crash_handler {
@@ -435,11 +438,9 @@ impl super::CommandEncoder {
                         log::error!("Last GPU executed marker is '{last_marker}'");
                         log::info!("Marker history: {}", history);
                     }
-                    panic!("GPU has crashed in {}", ch.name);
+                    crate::device_lost(&format!("{place} ({})", ch.name));
                 }
-                None => {
-                    panic!("GPU has crashed, and no debug information is available.");
-                }
+                None => crate::device_lost(place),
             },
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 log::warn!("GPU frame is out of date");

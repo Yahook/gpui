@@ -107,6 +107,9 @@ impl super::Surface {
                 self.lost = true;
                 self.frame_without_image()
             }
+            // Logged as any other error, it froze the window: every acquire
+            // after it fails the same way, and nothing ever draws again.
+            Err(vk::Result::ERROR_DEVICE_LOST) => crate::device_lost("acquire"),
             Err(other) => {
                 log::error!("Acquire image error: {}", other);
                 self.frame_without_image()
@@ -131,7 +134,11 @@ static FAKE_OUT_OF_DATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Whether this acquire is the Nth since the last faked one, N read once from
 // `variable`; never when it is unset, zero or not a number.
-fn fake_every_nth(variable: &str, every: &OnceLock<Option<u64>>, count: &AtomicU64) -> bool {
+pub(super) fn fake_every_nth(
+    variable: &str,
+    every: &OnceLock<Option<u64>>,
+    count: &AtomicU64,
+) -> bool {
     let every = *every.get_or_init(|| {
         std::env::var(variable)
             .ok()

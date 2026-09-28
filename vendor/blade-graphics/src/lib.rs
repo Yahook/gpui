@@ -85,6 +85,27 @@ pub mod limits {
 
 pub use hal::*;
 
+static DEVICE_LOST_HOOK: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Sets what runs when the GPU device is lost (`VK_ERROR_DEVICE_LOST`: a
+/// driver reset, a driver updated underneath, a resume the driver did not
+/// survive). Nothing made from the lost device works again, so blade panics
+/// once the hook returns; a hook that can do better does not return - it
+/// starts the application again, say, or exits with a word. It is told where
+/// the loss was seen. Only the first hook set counts.
+pub fn set_device_lost_hook(hook: fn(&str)) {
+    let _ = DEVICE_LOST_HOOK.set(hook);
+}
+
+#[allow(dead_code)] // Only the Vulkan backend tells a lost device apart yet.
+pub(crate) fn device_lost(place: &str) -> ! {
+    log::error!("GPU device lost in {place}");
+    if let Some(hook) = DEVICE_LOST_HOOK.get() {
+        hook(place);
+    }
+    panic!("GPU has crashed: the device was lost in {place}");
+}
+
 #[cfg(target_arch = "wasm32")]
 pub const CANVAS_ID: &str = "blade";
 

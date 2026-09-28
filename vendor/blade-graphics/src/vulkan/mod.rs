@@ -518,12 +518,23 @@ impl crate::traits::CommandDevice for Context {
             .wait_dst_stage_mask(&wait_stages[..num_wait_semaphores])
             .signal_semaphores(&signal_semaphores_all[..num_signal_sepahores])
             .push_next(&mut timeline_info);
-        let ret = unsafe {
-            self.device
-                .core
-                .queue_submit(queue.raw, &[vk_info], vk::Fence::null())
+        // Said on stderr, not through `log`, like the surface fakes: a check
+        // has to see it whether or not the application installed a logger.
+        let ret = if surface::fake_every_nth(
+            FAKE_DEVICE_LOST,
+            &FAKE_DEVICE_LOST_EVERY,
+            &FAKE_DEVICE_LOST_COUNT,
+        ) {
+            eprintln!("blade: faking a lost device ({FAKE_DEVICE_LOST})");
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        } else {
+            unsafe {
+                self.device
+                    .core
+                    .queue_submit(queue.raw, &[vk_info], vk::Fence::null())
+            }
         };
-        encoder.check_gpu_crash(ret);
+        encoder.check_gpu_crash(ret, "queue submit");
 
         if let Some(presentation) = encoder.present.take() {
             let khr_swapchain = self.device.swapchain.as_ref().unwrap();
@@ -535,7 +546,7 @@ impl crate::traits::CommandDevice for Context {
                 .image_indices(&image_indices)
                 .wait_semaphores(&wait_semaphores);
             let ret = unsafe { khr_swapchain.queue_present(queue.raw, &present_info) };
-            let _ = encoder.check_gpu_crash(ret);
+            let _ = encoder.check_gpu_crash(ret, "present");
         }
 
         SyncPoint { progress }
@@ -551,14 +562,27 @@ impl crate::traits::CommandDevice for Context {
             .semaphores(&semaphores)
             .values(&semaphore_values);
         let timeout_ns = map_timeout(timeout_ms);
-        unsafe {
+        let ret = unsafe {
             self.device
                 .timeline_semaphore
                 .wait_semaphores(&wait_info, timeout_ns)
-                .is_ok()
+        };
+        match ret {
+            Ok(()) => true,
+            // A lost device never signals, and "not yet" here had gpui wait
+            // for it in a loop that never ended.
+            Err(vk::Result::ERROR_DEVICE_LOST) => crate::device_lost("semaphore wait"),
+            Err(_) => false,
         }
     }
 }
+
+/// Makes every Nth submit report a lost device, N from this variable - the
+/// only way to see what an application does then: a real
+/// `VK_ERROR_DEVICE_LOST` takes a driver reset.
+const FAKE_DEVICE_LOST: &str = "BLADE_FAKE_DEVICE_LOST";
+static FAKE_DEVICE_LOST_EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+static FAKE_DEVICE_LOST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn map_texture_format(format: crate::TextureFormat) -> vk::Format {
     use crate::TextureFormat as Tf;
