@@ -590,6 +590,14 @@ impl X11Client {
                     Ok(None) => {
                         break;
                     }
+                    // The connection is gone for good (the X server died or
+                    // restarted): its fd stays readable at EOF, so logging and
+                    // going on spins the loop at full CPU forever. Ending the
+                    // event source ends `run`, and the app quits as it would
+                    // on `quit()`. Upstream zed does the same.
+                    Err(err @ ConnectionError::IoError(..)) => {
+                        return Err(EventHandlerError::from(err));
+                    }
                     Err(err) => {
                         let err = handle_connection_error(err);
                         log::warn!("error while polling for X11 events: {err:?}");

@@ -3,7 +3,8 @@
 This is [gpui](https://crates.io/crates/gpui) 0.2.2 — the last published
 release — with four X11 window bugs fixed, a lost Vulkan surface (section 5) made
 again instead of taking the application down, and a lost GPU device (section
-7) handed to the application instead of a panic. The base commit is the crates.io
+7) handed to the application instead of a panic, and a dead X server (section
+8) ending the application instead of spinning it. The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -224,6 +225,25 @@ Measured on 2026-09-28, panefold on lavapipe under Xvfb with
 pid, each window drawing again 73-89 ms after its image started (plus a one
 second pause panefold leaves the driver); the fourth within five minutes made
 panefold give up with exit code 75 and a line saying why. No panic in the log.
+
+## 8. A dead X server left the application spinning at full CPU
+
+`x11/client.rs`, `process_x11_events`: an error from `poll_for_event` was
+logged and the loop went on. When the X server dies or restarts, the
+connection's fd stays readable at EOF, so the level-triggered calloop source
+woke the loop again at once, forever: the process never quit and burnt a core
+until killed, logging `X11 connection: IOError` with a dedup counter in the
+millions.
+
+Fixed as `zed-industries/zed` `main` already has it
+(`crates/gpui_linux/src/linux/x11/client.rs`, checked 2026-09-30): an
+`IoError` returns `Err` from the event source, which ends `run`, and the
+platform's quit callback shuts the app down as `quit()` would. Other
+connection errors are logged as before.
+
+Measured on 2026-09-30, panefold on lavapipe under Xvfb, killing only Xvfb:
+the process gone 0.1 s later. The same panefold on the previous rev was still
+alive 5 s later at 100% of a core.
 
 ## Rebasing onto a newer gpui
 
