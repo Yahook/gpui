@@ -4,7 +4,8 @@ This is [gpui](https://crates.io/crates/gpui) 0.2.2 — the last published
 release — with four X11 window bugs fixed, a lost Vulkan surface (section 5) made
 again instead of taking the application down, and a lost GPU device (section
 7) handed to the application instead of a panic, and a dead X server (section
-8) ending the application instead of spinning it. The base commit is the crates.io
+8) ending the application instead of spinning it, and test windows that report
+only what their last frame drew (section 9). The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -244,6 +245,26 @@ connection errors are logged as before.
 Measured on 2026-09-30, panefold on lavapipe under Xvfb, killing only Xvfb:
 the process gone 0.1 s later. The same panefold on the previous rev was still
 alive 5 s later at 100% of a core.
+
+## 9. A test window reported elements no frame drew any more
+
+`window.rs`, `Frame::clear` cleared hitboxes, the scene and the rest, but not
+`debug_bounds`, the map `VisualTestContext::debug_bounds` reads. The window
+swaps two frames, so each buffer kept every `debug_selector` ever painted into
+it: `debug_bounds(sel).is_none()` failed for anything drawn once, and
+`is_some()` passed for an element long gone. Test support only; nothing a user
+sees.
+
+Fixed as `zed-industries/zed` `main` has it (`crates/gpui/src/window.rs`,
+checked 2026-10-09 at `f0b38ac`): `clear` empties the map, and since a cached
+view is not painted again, each frame also keeps its selectors in paint order
+(`debug_bounds_records`) and `reuse_paint` carries a reused view's over by the
+`PaintIndex` range, as it does its cursor styles. A bare `clear` would have
+lost the selectors of every cached view (panefold's rail is one).
+
+Measured on 2026-10-09 against panefold: four tests asserting that an element
+went away (a menu's mark, a row's pencil, Codex's `fast`, a search bar's note)
+fail on the previous rev and pass on this one; all 1510 pass.
 
 ## Rebasing onto a newer gpui
 
