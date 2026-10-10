@@ -4,8 +4,10 @@ This is [gpui](https://crates.io/crates/gpui) 0.2.2 — the last published
 release — with four X11 window bugs fixed, a lost Vulkan surface (section 5) made
 again instead of taking the application down, and a lost GPU device (section
 7) handed to the application instead of a panic, and a dead X server (section
-8) ending the application instead of spinning it, and test windows that report
-only what their last frame drew (section 9). The base commit is the crates.io
+8) ending the application instead of spinning it, test windows that report
+only what their last frame drew (section 9), and a tooltip too wide for either
+side of the pointer kept against the window's edge instead of thrown to its
+far side (section 10). The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -265,6 +267,26 @@ lost the selectors of every cached view (panefold's rail is one).
 Measured on 2026-10-09 against panefold: four tests asserting that an element
 went away (a menu's mark, a row's pencil, Codex's `fast`, a search bar's note)
 fail on the previous rev and pass on this one; all 1510 pass.
+
+## 10. A tooltip with no room beside the pointer jumped to the window's far edge
+
+`window.rs`, `prepaint_tooltip`: a tooltip that does not fit right of the
+pointer goes left of it, and when that has no room either it was put at
+`max(0, origin.x - right() - window_right)`. `origin.x - right()` is minus the
+width, so the whole came to 0 every time, and the tooltip stood at the
+window's left edge, far from the pointer, over whatever was there. The same
+formula, with the same result, for the bottom edge.
+
+Measured on panefold on 2026-09-28: a History window 1180 px wide, a tooltip
+640 px wide (its `40rem` cap), the pointer at x≈540 - the tooltip landed at
+x = 0, over the rail. A window wider than twice the tooltip never meets it,
+which is why it hid.
+
+Fixed by putting the tooltip against the edge it overflowed
+(`window_right - width`, never below 0), in a function of its own
+(`tooltip_bounds_in`) with unit tests: an 800 px window, a 600 px tooltip, the
+pointer at 400 - x = 200, not 0. `zed-industries/zed` `main` still has the
+formula (`crates/gpui/src/window.rs`, checked 2026-10-11 at `93d7456688`).
 
 ## Rebasing onto a newer gpui
 

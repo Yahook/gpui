@@ -2124,36 +2124,8 @@ impl Window {
             let mouse_position = tooltip_request.tooltip.mouse_position;
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
 
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
-            let window_bounds = Bounds {
-                origin: Point::default(),
-                size: self.viewport_size(),
-            };
-
-            if tooltip_bounds.right() > window_bounds.right() {
-                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
-                    tooltip_bounds.origin.x = new_x;
-                } else {
-                    tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                    );
-                }
-            }
-
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
-                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
-                    tooltip_bounds.origin.y = new_y;
-                } else {
-                    tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
-                    );
-                }
-            }
+            let tooltip_bounds =
+                tooltip_bounds_in(mouse_position, tooltip_size, self.viewport_size());
 
             // It's possible for an element to have an active tooltip while not being painted (e.g.
             // via the `visible_on_hover` method). Since mouse listeners are not active in this
@@ -5133,5 +5105,76 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+/// Where a tooltip of `size` goes for the pointer at `mouse` in a window of
+/// `viewport`: right of and below the pointer; past the window's right or
+/// bottom edge, left of or above it; and when that side has no room either,
+/// against the window's edge, as far over as the window allows.
+///
+/// Upstream (and gpui 0.2.2) wrote that last case as
+/// `max(0, origin - right() - window_right)`: `origin - right()` is minus the
+/// width, so it always came to 0, and a tooltip too wide for either side of
+/// the pointer jumped to the window's far edge (PANEFOLD.md, section 10).
+fn tooltip_bounds_in(
+    mouse: Point<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+) -> Bounds<Pixels> {
+    let mut bounds = Bounds::new(mouse + point(px(1.), px(1.)), size);
+    if bounds.right() > viewport.width {
+        let new_x = mouse.x - size.width - px(1.);
+        bounds.origin.x = if new_x >= Pixels::ZERO {
+            new_x
+        } else {
+            cmp::max(Pixels::ZERO, viewport.width - size.width)
+        };
+    }
+    if bounds.bottom() > viewport.height {
+        let new_y = mouse.y - size.height - px(1.);
+        bounds.origin.y = if new_y >= Pixels::ZERO {
+            new_y
+        } else {
+            cmp::max(Pixels::ZERO, viewport.height - size.height)
+        };
+    }
+    bounds
+}
+
+#[cfg(test)]
+mod tooltip_bounds_tests {
+    use super::*;
+
+    fn at(mouse: (f32, f32), tip: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+        let bounds = tooltip_bounds_in(
+            point(px(mouse.0), px(mouse.1)),
+            size(px(tip.0), px(tip.1)),
+            size(px(viewport.0), px(viewport.1)),
+        );
+        (f32::from(bounds.origin.x), f32::from(bounds.origin.y))
+    }
+
+    #[test]
+    fn a_tooltip_goes_right_of_and_below_the_pointer_when_it_fits() {
+        assert_eq!(at((100., 100.), (200., 50.), (800., 600.)), (101., 101.));
+    }
+
+    #[test]
+    fn past_the_right_edge_it_goes_left_of_the_pointer() {
+        assert_eq!(at((700., 100.), (200., 50.), (800., 600.)), (499., 101.));
+    }
+
+    #[test]
+    fn with_no_room_either_side_it_stands_against_the_right_edge() {
+        // 600 wide in an 800 window, pointer at 400: neither 401..1001 nor
+        // -201..399 fits. Against the right edge, not at the left one.
+        assert_eq!(at((400., 100.), (600., 50.), (800., 600.)).0, 200.);
+        assert_eq!(at((400., 550.), (100., 580.), (800., 600.)).1, 20.);
+    }
+
+    #[test]
+    fn a_tooltip_wider_than_the_window_starts_at_its_left_edge() {
+        assert_eq!(at((400., 100.), (900., 50.), (800., 600.)).0, 0.);
     }
 }
