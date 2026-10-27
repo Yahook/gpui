@@ -25,6 +25,14 @@ struct BladeAtlasState {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     initializations: Vec<AtlasTextureId>,
     uploads: Vec<PendingUpload>,
+    /// The last frame submitted, which may still be drawing: the renderer
+    /// waits for a frame only once the next one is submitted.
+    last_sync_point: Option<gpu::SyncPoint>,
+    /// Textures no tile uses any more, kept until the frame that may still
+    /// sample them is done. Destroyed at once, the GPU read freed memory and
+    /// an Intel GPU hung (`GPU HANG ... preemption time out`) about one close
+    /// of a picture in ten.
+    retired: Vec<(BladeAtlasTexture, Option<gpu::SyncPoint>)>,
 }
 
 #[cfg(gles)]
@@ -33,7 +41,24 @@ unsafe impl Send for BladeAtlasState {}
 impl BladeAtlasState {
     fn destroy(&mut self) {
         self.storage.destroy(&self.gpu);
+        for (mut texture, _) in self.retired.drain(..) {
+            texture.destroy(&self.gpu);
+        }
         self.upload_belt.destroy(&self.gpu);
+    }
+
+    /// Destroys the retired textures whose last frame is done.
+    fn destroy_retired(&mut self) {
+        let gpu = &self.gpu;
+        self.retired.retain_mut(|(texture, sync_point)| {
+            let done = sync_point
+                .as_ref()
+                .is_none_or(|sync_point| gpu.wait_for(sync_point, 0));
+            if done {
+                texture.destroy(gpu);
+            }
+            !done
+        });
     }
 }
 
@@ -54,6 +79,8 @@ impl BladeAtlas {
             tiles_by_key: Default::default(),
             initializations: Vec::new(),
             uploads: Vec::new(),
+            last_sync_point: None,
+            retired: Vec::new(),
         }))
     }
 
@@ -63,12 +90,14 @@ impl BladeAtlas {
 
     pub fn before_frame(&self, gpu_encoder: &mut gpu::CommandEncoder) {
         let mut lock = self.0.lock();
+        lock.destroy_retired();
         lock.flush(gpu_encoder);
     }
 
     pub fn after_frame(&self, sync_point: &gpu::SyncPoint) {
         let mut lock = self.0.lock();
         lock.upload_belt.flush(sync_point);
+        lock.last_sync_point = Some(sync_point.clone());
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> BladeTextureInfo {
@@ -118,7 +147,12 @@ impl PlatformAtlas for BladeAtlas {
                 lock.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
-                texture.destroy(&lock.gpu);
+                // Not yet sent to the GPU: the slot may hold another texture
+                // by the next flush, which would take this one's pixels.
+                lock.uploads.retain(|upload| upload.id != id);
+                lock.initializations.retain(|init| *init != id);
+                let sync_point = lock.last_sync_point.clone();
+                lock.retired.push((texture, sync_point));
             } else {
                 *texture_slot = Some(texture);
             }

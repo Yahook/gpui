@@ -7,7 +7,8 @@ again instead of taking the application down, and a lost GPU device (section
 8) ending the application instead of spinning it, test windows that report
 only what their last frame drew (section 9), and a tooltip too wide for either
 side of the pointer kept against the window's edge instead of thrown to its
-far side (section 10). The base commit is the crates.io
+far side (section 10), and an atlas texture kept until the frame that samples
+it is done instead of destroyed under it (section 11). The base commit is the crates.io
 tarball, unmodified, so `git diff <base>..HEAD` is the whole divergence: four
 files, about 200 lines, most of them comment.
 
@@ -287,6 +288,33 @@ Fixed by putting the tooltip against the edge it overflowed
 (`tooltip_bounds_in`) with unit tests: an 800 px window, a 600 px tooltip, the
 pointer at 400 - x = 200, not 0. `zed-industries/zed` `main` still has the
 formula (`crates/gpui/src/window.rs`, checked 2026-10-11 at `93d7456688`).
+
+## 11. A dropped picture's texture was destroyed while the GPU still read it
+
+`blade_atlas.rs`, `remove`: once no tile used an atlas texture, it was
+destroyed there and then. `BladeRenderer::draw` submits a frame and waits only
+for the one before it, so the frame just submitted is often still drawing when
+the application runs again - and `App::drop_image` in that gap destroyed a
+texture that frame samples. A picture wider or taller than 1024 px gets a
+texture of its own, so closing it is exactly that case; so is every frame of a
+video drawn as a `RenderImage`.
+
+Measured on panefold on 2026-10-27, Intel UHD 770 (Alder Lake-S, i915, Mesa
+25.2.8 anv, IOMMU on), a 1280x720 PNG opened and closed in the media panel
+over a terminal that redraws without pause: the GPU hung (`Resetting rcs0 for
+preemption time out`, `GPU HANG: ecode 12:1:85dffdfb`) 5 times in some 110
+closes, and the window froze for the preemption timeout (7.5 s on Ubuntu's
+kernel) before blade reported a lost device. The same frames on NVIDIA or
+lavapipe never hung, and nothing hung without the redraws, when the last frame
+was long done by the time of the close.
+
+Fixed by retiring the texture instead: `remove` takes it out of its slot as
+before but keeps it, with the sync point of the last frame submitted, until
+`before_frame` finds that frame done. Its uploads and initialization not yet
+sent to the GPU are dropped at once, or the slot's next texture would take
+them at the next flush. With the fix the same run did 120 closes without a
+hang. Whether `zed-industries/zed` `main` still has it is not checked: its
+Linux renderer has moved since 0.2.2.
 
 ## Rebasing onto a newer gpui
 
