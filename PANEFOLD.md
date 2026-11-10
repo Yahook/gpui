@@ -316,6 +316,23 @@ them at the next flush. With the fix the same run did 120 closes without a
 hang. Whether `zed-industries/zed` `main` still has it is not checked: its
 Linux renderer has moved since 0.2.2.
 
+## 12. A dependency a future Rust will not build
+
+`stacksafe = "0.1"`: `stacksafe-macro 0.1.4` builds with `proc-macro-error2
+2.0.1`, whose `pub use proc_macro;` (`src/lib.rs:494`) re-exports a private
+extern crate. rustc 1.99.1 accepts it with a future-incompat warning (E0365,
+"previously accepted by the compiler but is being phased out; it will become
+a hard error in a future release"), printed at the end of every build of an
+application on this fork. `proc-macro-error2` has had no release since.
+
+Fixed by `stacksafe = "1"`: `stacksafe-macro 1.0.3` builds with `proc-macro2`,
+`quote` and `syn` alone. The API the fork uses, `#[stacksafe]` and
+`StackSafe<T>` in `taffy.rs` and `elements/div.rs`, is the same in 1.x. The
+lock moves `proc-macro2`, `quote` and `stacker` to the versions `stacksafe
+1.0.3` asks for and adds `syn 3`. Checked on panefold on 2026-11-11: `cargo
+tree -i proc-macro-error2` names nothing, the warning is gone, and its tests
+pass.
+
 ## Rebasing onto a newer gpui
 
 `git diff 0aaf41f..HEAD -- src/` is the whole patch to gpui. Nothing touches a
