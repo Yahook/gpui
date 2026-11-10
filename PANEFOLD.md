@@ -377,3 +377,16 @@ a window saved `900x600 maximized` coming back maximized and unmaximizing to
 `900x600` where it was left. Bug 4 the same day: maximize, minimize, quit, and
 `state.toml` still said `2494x1371 maximized = true`; reopened, the window came
 back maximized.
+
+## 13. Two float literals a future Rust will not type
+
+`taffy.rs`, `to_grid_repeat`: `minmax(length(0.0), fr(1.0))`. rustc 1.99.1
+types both literals by falling back to `f32`, which it warns a future release
+will reject (`float_literal_f32_fallback`, rust-lang/rust#154024). A build
+that takes the fork from git never shows it: Cargo caps the lints of a git
+dependency, and this one is not in its future-incompat summary either, so it
+would have broken the build without a word. It only shows with the fork
+patched in by `path`.
+
+Fixed by `0.0_f32` and `1.0_f32`, the types the fallback picks today. Whether
+`zed-industries/zed` `main` still has it is not checked.
